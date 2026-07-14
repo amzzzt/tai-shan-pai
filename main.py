@@ -25,6 +25,65 @@ ALL_BONES = PALM_BONES + THUMB_BONES + FINGER_BONES
 #骨骼上用到的关节点（画圆点用）
 JOINTS = sorted({i for bone in ALL_BONES for i in bone})
 
+def convert_lab_thresholds(openmv_thresholds):
+    """OpenMV风格LAB阈值 [Lmin,Lmax,amin,amax,bmin,bmax] 转OpenCV范围"""
+    l_min, l_max, a_min, a_max, b_min, b_max = openmv_thresholds
+    lower_bound = np.array([int(l_min * 2.55), int(a_min + 128), int(b_min + 128)])
+    upper_bound = np.array([int(l_max * 2.55), int(a_max + 128), int(b_max + 128)])
+    return lower_bound, upper_bound
+
+#===== 绿色花露水识别配置 =====
+#绿花露水→蓝框
+#L上限85：过曝的灯光亮度接近100，直接排除
+#A上限-15：要求足够"绿"（防灯主力是饱和度校验，这里不用卡太死）
+GREEN_HLS_LOWER, GREEN_HLS_UPPER = convert_lab_thresholds([15, 85, -128, -15, -30, 70])
+GREEN_HLS_BOX_COLOR = (255, 0, 0)   #蓝色(BGR)
+KERNEL_OPEN = np.ones((3, 3), np.uint8)    #小核去噪，保住小碎块
+KERNEL_CLOSE = np.ones((25, 25), np.uint8) #大核闭运算：把被反光/标签/手指撕碎的瓶身粘回一块
+
+def detect_green_bottle(frame):
+    """在半分辨率图上找绿色花露水，返回原图坐标 (x,y,w,h) 或 None
+
+    瓶身会被高光、标签、手指分割成碎块，所以：
+    1.大核闭运算粘合碎块 2.所有合格碎块取并集框，而不是只挑最大块
+    防灯光靠颜色阈值(亮度上限+绿度)和饱和度校验，不靠几何形状
+    """
+    half = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2))
+    lab = cv2.cvtColor(half, cv2.COLOR_BGR2LAB)
+    mask = cv2.inRange(lab, GREEN_HLS_LOWER, GREEN_HLS_UPPER)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL_OPEN)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, KERNEL_CLOSE)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    hsv = None  #用到时再转，省时间
+    #收集所有通过校验的绿色块，最后取并集框
+    min_x = min_y = 10**9
+    max_x = max_y = -1
+    total_area = 0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 150:              #门槛放低：被遮挡的碎块本来就不大
+            continue
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        #饱和度校验：过曝灯光接近白色S极低，绿瓶子S高
+        if hsv is None:
+            hsv = cv2.cvtColor(half, cv2.COLOR_BGR2HSV)
+        region_mask = mask[y:y + bh, x:x + bw]
+        mean_s = cv2.mean(hsv[y:y + bh, x:x + bw], mask=region_mask)[1]
+        if mean_s < 60:
+            continue
+        total_area += area
+        min_x = min(min_x, x); min_y = min(min_y, y)
+        max_x = max(max_x, x + bw); max_y = max(max_y, y + bh)
+
+    #所有碎块加起来还是太小，认为画面里没有瓶子
+    if total_area < 400:
+        return None
+    #半分辨率坐标放大回原图
+    return (min_x * 2, min_y * 2, (max_x - min_x) * 2, (max_y - min_y) * 2)
+
 #===== 后台推理线程共享状态 =====
 #推理耗时约210ms，放主循环里帧率只有几帧；
 #丢到后台线程后主循环只画图，帧率恢复到采集速度
@@ -100,15 +159,42 @@ if __name__ == "__main__":
 
     last_time = time.time()
 
+    #瓶子状态保持：检测到后维持30帧（约半秒），
+    #手握瓶子时个别帧检测失败也不会闪回手掌模式
+    BOTTLE_HOLD_FRAMES = 30
+    bottle_box = None
+    bottle_ttl = 0
+
     while True:
         ret ,frame = cap.read()
         if not ret :
             continue
 
-        #把最新中央画面交给推理线程（copy避免和绘制互相干扰）
-        with state_lock:
-            latest_roi = frame[y0:y1, x0:x1].copy()
-            pts = cached_pts
+        #先找绿色花露水：出现瓶子时只框瓶子，不标手掌
+        det = detect_green_bottle(frame)
+        if det is not None:
+            bottle_box = det
+            bottle_ttl = BOTTLE_HOLD_FRAMES
+        elif bottle_ttl > 0:
+            bottle_ttl -= 1
+            if bottle_ttl == 0:
+                bottle_box = None
+
+        if bottle_box is not None:
+            #瓶子模式：让推理线程歇着，并清掉旧骨骼，避免残影
+            with state_lock:
+                latest_roi = None
+                cached_pts = None
+                pts = None
+            bx, by, bw, bh = bottle_box
+            cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), GREEN_HLS_BOX_COLOR, 2)
+            cv2.putText(frame, "six god", (bx, max(by - 8, 16)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, GREEN_HLS_BOX_COLOR, 2)
+        else:
+            #把最新中央画面交给推理线程（copy避免和绘制互相干扰）
+            with state_lock:
+                latest_roi = frame[y0:y1, x0:x1].copy()
+                pts = cached_pts
 
         #画出识别区域边界（细绿框），手放进框内才会识别
         cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 0), 1)
