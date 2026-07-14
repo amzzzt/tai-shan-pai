@@ -27,7 +27,8 @@ if __name__ == "__main__":
     fps = 0
 
     last_time = time.time()
-    lower_, upper_ = convert_lab_thresholds([31,100,-128,124,-128,21])
+    #绿色花露水瓶阈值：a通道取负值区（绿），可对照网页流微调
+    lower_, upper_ = convert_lab_thresholds([15,95,-128,-12,-30,70])
 
     while True:
         ret ,frame = cap.read()
@@ -35,50 +36,47 @@ if __name__ == "__main__":
             continue
         frame = frame[180:540 , 320:960]    #先y后x
 
-        frame_drawn = frame.copy()
-
-        cv2.putText(frame_drawn,"fps: {}".format(round(fps,2)),[50,50],cv2.FONT_HERSHEY_SIMPLEX,2,[255,0,0],2)
-
-        frame_drawn = cv2.cvtColor(frame_drawn,cv2.COLOR_BGR2LAB)
-        frame_drawn = cv2.inRange(frame_drawn,lower_,upper_)
+        mask = cv2.cvtColor(frame,cv2.COLOR_BGR2LAB)
+        mask = cv2.inRange(mask,lower_,upper_)
 
         #去除小噪点
         kernel = np.ones((5, 5), np.uint8)
-        frame_drawn = cv2.morphologyEx(frame_drawn, cv2.MORPH_OPEN, kernel)
-        frame_drawn = cv2.morphologyEx(frame_drawn, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        #检测边缘
-        frame_drawn = cv2.Canny(frame_drawn,50,150)
+        #直接在二值掩码上找外轮廓（不需要Canny，轮廓封闭更完整）
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        #检测多边形轮廓点
-        contours, _ = cv2.findContours(frame_drawn, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        
+        #在杂物中挑出最像花露水瓶的目标：面积最大的竖长绿色块
+        best = None
+        best_area = 0
         for cnt in contours:
              # 计算面积
              area = cv2.contourArea(cnt)
              if area < 2000:
                   continue
 
-             # 计算周长
-             perimeter = cv2.arcLength(cnt, True)
+             x, y, w, h = cv2.boundingRect(cnt)
 
-             # 拟合
-             approx = cv2.approxPolyDP(cnt, 0.02 * perimeter, True)
-             if not len(approx) == 4:
-                continue
+             # 花露水瓶是竖长的，过滤掉扁平的绿色杂物（横放请去掉此判断）
+             if h < w * 1.2:
+                  continue
 
-             p_0 = approx[0][0] # [796,344]
-             p_1 = approx[1][0] # [796,344]
-             p_2 = approx[2][0] # [796,344]
-             p_3 = approx[3][0] # [796,344]
+             if area > best_area:
+                  best_area = area
+                  best = (x, y, w, h)
 
-             cv2.line(frame, p_0, p_1, (0, 255, 0), 2)
-             cv2.line(frame, p_1, p_2, (0, 255, 0), 2)
-             cv2.line(frame, p_2, p_3, (0, 255, 0), 2)
-             cv2.line(frame, p_3, p_0, (0, 255, 0), 2)
+        if best is not None:
+             x, y, w, h = best
+             #红色框(BGR)框出花露水
+             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 3)
+             cv2.putText(frame, "HuaLuShui", (x, max(y - 10, 20)),
+                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+        cv2.putText(frame,"fps: {}".format(round(fps,2)),[50,50],cv2.FONT_HERSHEY_SIMPLEX,2,[255,0,0],2)
 
         streamer.update_frame(0,frame)
-        streamer.update_frame(1,frame_drawn)
+        streamer.update_frame(1,mask)
         curr_time = time.time()
         fps = (1 / (curr_time - last_time) *0.3 + fps * 0.7)
         last_time = curr_time
