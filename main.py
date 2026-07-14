@@ -1,15 +1,66 @@
 import cv2
 from xbhdcc_tools import detect_cameras,WebStreamer
 import time
+import threading
 import numpy as np
+import mediapipe as mp
 
-#[31, 100, -128, 124, -128, 21]
+#MediaPipe手部21个关键点编号：0=手腕 1-4=大拇指 5-8=食指 9-12=中指 13-16=无名指 17-20=小指
 
-def convert_lab_thresholds(openmv_thresholds):
-    l_min, l_max, a_min, a_max, b_min, b_max = openmv_thresholds
-    lower_bound = np.array([int(l_min * 2.55), int(a_min + 128), int(b_min + 128)])
-    upper_bound = np.array([int(l_max * 2.55), int(a_max + 128), int(b_max + 128)])
-    return lower_bound, upper_bound
+#手指骨骼：四根手指每根3节
+FINGER_BONES = [
+    (5, 6), (6, 7), (7, 8),      #食指 3节
+    (9, 10), (10, 11), (11, 12), #中指 3节
+    (13, 14), (14, 15), (15, 16),#无名指 3节
+    (17, 18), (18, 19), (19, 20),#小指 3节
+]
+
+#大拇指只有2节（3节要求的例外）
+THUMB_BONES = [(2, 3), (3, 4)]
+
+#手掌3节：手腕->拇指根、手腕->食指根、食指根->小指根
+PALM_BONES = [(0, 2), (0, 5), (5, 17)]
+
+ALL_BONES = PALM_BONES + THUMB_BONES + FINGER_BONES
+#骨骼上用到的关节点（画圆点用）
+JOINTS = sorted({i for bone in ALL_BONES for i in bone})
+
+#===== 后台推理线程共享状态 =====
+#推理耗时约210ms，放主循环里帧率只有几帧；
+#丢到后台线程后主循环只画图，帧率恢复到采集速度
+latest_roi = None      #主循环写入最新的中央区域画面
+cached_pts = None      #推理线程写入最新的关键点（原图坐标）
+state_lock = threading.Lock()
+running = True
+
+def inference_worker(hands, roi_offset, roi_size):
+    """后台推理线程：不断取最新中央画面跑模型，更新关键点"""
+    global cached_pts
+    x0, y0 = roi_offset
+    rw, rh = roi_size
+    lost_count = 0
+    while running:
+        with state_lock:
+            roi = None if latest_roi is None else latest_roi.copy()
+        if roi is None:
+            time.sleep(0.01)
+            continue
+
+        result = hands.process(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+
+        if result.multi_hand_landmarks:
+            hand_lm = result.multi_hand_landmarks[0]
+            #归一化坐标映射回ROI再平移到原图
+            pts = [(x0 + int(lm.x * rw), y0 + int(lm.y * rh))
+                   for lm in hand_lm.landmark]
+            with state_lock:
+                cached_pts = pts
+            lost_count = 0
+        else:
+            lost_count += 1
+            if lost_count >= 3:
+                with state_lock:
+                    cached_pts = None
 
 if __name__ == "__main__":
     detect_cameras()
@@ -19,64 +70,61 @@ if __name__ == "__main__":
     fourcc = cv2.VideoWriter_fourcc(*'MJPG')
     cap.set(cv2.CAP_PROP_FOURCC,fourcc)
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,720)
+    #降低分辨率换帧率
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)
     cap.set(cv2.CAP_PROP_FPS,60)
 
     streamer = WebStreamer(port=8080)
     fps = 0
 
+    #手部识别模型：complexity=0为轻量版
+    hands = mp.solutions.hands.Hands(
+        static_image_mode=False,
+        max_num_hands=1,
+        model_complexity=0,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5)
+
+    #读一帧确定实际分辨率，算出中央识别区域
+    ret, frame = cap.read()
+    h, w = frame.shape[:2]
+    #只识别画面中央区域（宽高各一半），角落的手不识别
+    x0, y0 = w // 4, h // 4
+    x1, y1 = w * 3 // 4, h * 3 // 4
+
+    worker = threading.Thread(target=inference_worker,
+                              args=(hands, (x0, y0), (x1 - x0, y1 - y0)),
+                              daemon=True)
+    worker.start()
+
     last_time = time.time()
-    #绿色花露水瓶阈值：a通道取负值区（绿），可对照网页流微调
-    lower_, upper_ = convert_lab_thresholds([15,95,-128,-12,-30,70])
 
     while True:
         ret ,frame = cap.read()
         if not ret :
             continue
-        frame = frame[180:540 , 320:960]    #先y后x
 
-        mask = cv2.cvtColor(frame,cv2.COLOR_BGR2LAB)
-        mask = cv2.inRange(mask,lower_,upper_)
+        #把最新中央画面交给推理线程（copy避免和绘制互相干扰）
+        with state_lock:
+            latest_roi = frame[y0:y1, x0:x1].copy()
+            pts = cached_pts
 
-        #去除小噪点
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        #画出识别区域边界（细绿框），手放进框内才会识别
+        cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 0), 1)
 
-        #直接在二值掩码上找外轮廓（不需要Canny，轮廓封闭更完整）
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if pts is not None:
+            #红色线段拼接骨骼
+            for a, b in ALL_BONES:
+                cv2.line(frame, pts[a], pts[b], (0, 0, 255), 2)
+            #关节点画小红点
+            for i in JOINTS:
+                cv2.circle(frame, pts[i], 3, (0, 0, 255), -1)
 
-        #在杂物中挑出最像花露水瓶的目标：面积最大的竖长绿色块
-        best = None
-        best_area = 0
-        for cnt in contours:
-             # 计算面积
-             area = cv2.contourArea(cnt)
-             if area < 2000:
-                  continue
+        cv2.putText(frame,"fps: {}".format(round(fps,2)),[30,30],cv2.FONT_HERSHEY_SIMPLEX,1,[255,0,0],2)
 
-             x, y, w, h = cv2.boundingRect(cnt)
-
-             # 花露水瓶是竖长的，过滤掉扁平的绿色杂物（横放请去掉此判断）
-             if h < w * 1.2:
-                  continue
-
-             if area > best_area:
-                  best_area = area
-                  best = (x, y, w, h)
-
-        if best is not None:
-             x, y, w, h = best
-             #红色框(BGR)框出花露水
-             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 3)
-             cv2.putText(frame, "HuaLuShui", (x, max(y - 10, 20)),
-                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-        cv2.putText(frame,"fps: {}".format(round(fps,2)),[50,50],cv2.FONT_HERSHEY_SIMPLEX,2,[255,0,0],2)
-
+        #只推一路视频
         streamer.update_frame(0,frame)
-        streamer.update_frame(1,mask)
         curr_time = time.time()
         fps = (1 / (curr_time - last_time) *0.3 + fps * 0.7)
         last_time = curr_time
