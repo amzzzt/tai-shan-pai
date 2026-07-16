@@ -3,6 +3,7 @@ from xbhdcc_tools import WebStreamer
 import time
 import os
 from green_ball_detector import GreenBallDetector
+from serial_comm import SerialComm
 
 if __name__ == "__main__":
     os.system("fuser -k 8080/tcp /dev/video9 2>/dev/null")
@@ -17,6 +18,7 @@ if __name__ == "__main__":
 
     streamer = WebStreamer(port=8080)
     ball = GreenBallDetector()
+    serial_comm = SerialComm(port='/dev/ttyS7', baudrate=115200)
     fps = 0
     last_time = time.time()
 
@@ -28,6 +30,7 @@ if __name__ == "__main__":
 
         ball.detect(frame)
         ball.draw(frame)
+        serial_comm.send_error(ball.dx, ball.dy, ball.found)
 
         cv2.putText(frame, "fps: {}".format(round(fps, 2)), [50, 50],
                     cv2.FONT_HERSHEY_SIMPLEX, 2, [255, 0, 0], 2)
