@@ -11,8 +11,6 @@ class SerialComm:
 
     def send_error(self, dx, dy, found):
         now = time.time()
-        if now - self._last_send < 0.05:
-            return
         self._last_send = now
         try:
             found_byte = 0x01 if found else 0x00
