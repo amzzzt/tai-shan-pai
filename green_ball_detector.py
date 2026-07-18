@@ -7,7 +7,7 @@ import numpy as np
 class GreenBallDetector:
     def __init__(self):
         # LAB 阈值 (OpenMV 格式)
-        self.set_thresholds([0, 94, -20, 30, -128, 17])
+        self.set_thresholds([15, 79, -48, -5, 19, 104])
 
         # 追踪锁
         self.prev_cx, self.prev_cy, self.prev_r = 0, 0, 0
@@ -34,16 +34,14 @@ class GreenBallDetector:
         h, w = frame.shape[:2]
         cx0, cy0 = w // 2, h // 2
 
-        # 1. LAB 掩码
-        mask = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        mask = cv2.inRange(mask, self.lower, self.upper)
-        mask = cv2.bitwise_not(mask)
+        # 1. LAB 掩码（先中值滤波去噪，减少形态学负担）
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        mask = cv2.inRange(lab, self.lower, self.upper)
 
-        # 2. 形态学
-        k_small = np.ones((5, 5), np.uint8)
-        k_big = np.ones((11, 11), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_small)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_big)
+        # 2. 形态学：开运算去噪点 + 闭运算填洞
+        k = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
         self.mask = mask
 
         # 3. 轮廓筛选
@@ -60,7 +58,7 @@ class GreenBallDetector:
                 continue
 
             circ = (4.0 * np.pi * area) / (peri * peri)
-            if circ < 0.6:
+            if circ < 0.5:
                 continue
 
             hull = cv2.convexHull(cnt)
@@ -68,18 +66,19 @@ class GreenBallDetector:
             if hull_area < 1:
                 continue
             solidity = area / hull_area
-            if solidity < 0.75:
+            if solidity < 0.65:
                 continue
 
             (cx, cy), r = cv2.minEnclosingCircle(cnt)
             cx, cy, r = int(cx), int(cy), int(r)
-            if r < 12:
+            if r < 10:
                 continue
             fill = area / (np.pi * r * r)
-            if fill < 0.30:
+            if fill < 0.25:
                 continue
 
-            score = circ * area * solidity * fill
+            # 得分：半径的平方 × 圆形度 — 大圆严重优先
+            score = (r * r) * circ * solidity * fill
             if self.locked:
                 dist = np.sqrt((cx - self.prev_cx)**2 + (cy - self.prev_cy)**2)
                 search_r = max(self.prev_r * 4, 80)
@@ -90,16 +89,22 @@ class GreenBallDetector:
                 best_score = score
                 best = (cx, cy, r)
 
-        # 4. RGB 颜色验证
+        # 4. RGB 颜色验证（9 点稀疏采样）
         if best is not None:
             cx, cy, r = best
             sr = max(r - 3, 3)
-            y0, y1 = max(cy - sr, 0), min(cy + sr, h)
-            x0, x1 = max(cx - sr, 0), min(cx + sr, w)
-            roi = frame[y0:y1, x0:x1]
-            b, g, r_ch = roi[..., 0].astype(float), roi[..., 1].astype(float), roi[..., 2].astype(float)
-            gm = (g > r_ch * 1.15) & (g > b * 1.10)
-            if gm.size > 0 and gm.sum() / gm.size < 0.25:
+            offsets = [(0,0), (-sr,0), (sr,0), (0,-sr), (0,sr),
+                       (-sr//2,-sr//2), (sr//2,-sr//2), (-sr//2,sr//2), (sr//2,sr//2)]
+            green_cnt = 0
+            total = 0
+            for ox, oy in offsets:
+                px, py = cy + oy, cx + ox
+                if 0 <= px < h and 0 <= py < w:
+                    b, g, r_ch = frame[px, py].astype(float)
+                    if g > r_ch * 1.15 and g > b * 1.10:
+                        green_cnt += 1
+                    total += 1
+            if total > 0 and green_cnt / total < 0.3:
                 best = None
 
         # 5. 更新状态

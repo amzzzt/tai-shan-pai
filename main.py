@@ -14,7 +14,7 @@ if __name__ == "__main__":
     cap.set(cv2.CAP_PROP_FOURCC, fourcc)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_FPS, 30)
 
     streamer = WebStreamer(port=8080)
     ball = GreenBallDetector()
@@ -26,8 +26,7 @@ if __name__ == "__main__":
         ret, frame = cap.read()
         if not ret:
             continue
-        frame = frame[180:540, 320:960]
-
+        frame = cv2.flip(frame, 0)
         ball.detect(frame)
         ball.draw(frame)
         serial_comm.send_error(ball.dx, ball.dy, ball.found)
