@@ -2,8 +2,11 @@ import cv2
 from xbhdcc_tools import WebStreamer
 import time
 import os
-from target_detector import TargetDetector
+from diag_rect_detector import DiagRectDetector
 from serial_comm import SerialComm
+from scan_controller import ScanController
+
+STATE_NAMES = {0: "->TL", 10: "->TR", 11: "->BR", 12: "->BL", 13: "->TL"}
 
 if __name__ == "__main__":
     os.system("fuser -k 8080/tcp /dev/video9 2>/dev/null")
@@ -17,8 +20,10 @@ if __name__ == "__main__":
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     streamer = WebStreamer(port=8080)
-    rect = TargetDetector()
-    serial_comm = SerialComm(port='/dev/ttyS7', baudrate=115200)
+    td = DiagRectDetector()
+    sc = SerialComm(port='/dev/ttyS7', baudrate=115200)
+    scan = ScanController(td, sc)
+
     fps = 0
     last_time = time.time()
 
@@ -27,16 +32,41 @@ if __name__ == "__main__":
         if not ret:
             continue
         frame = cv2.flip(frame, 0)
-        rect.detect(frame)
-        rect.draw(frame)
-        serial_comm.send_error(rect.dx, rect.dy, rect.found)
+        h, w = frame.shape[:2]
 
-        cv2.putText(frame, "fps: {}".format(round(fps, 2)), [50, 50],
-                    cv2.FONT_HERSHEY_SIMPLEX, 2, [255, 0, 0], 2)
+        td.detect(frame)
+        target_pt, state = scan.update(h, w)
+
+        # 中心十字 + 内部绿色矩形框
+        cv2.line(frame, (w//2 - 15, h//2), (w//2 + 15, h//2), (255, 255, 255), 2)
+        cv2.line(frame, (w//2, h//2 - 15), (w//2, h//2 + 15), (255, 255, 255), 2)
+        if td.found and td.inner_pts is not None:
+            pts = td.inner_pts
+            # 先画对角线（蓝色，在下方）
+            cv2.line(frame, tuple(pts[0]), tuple(pts[2]), (255, 0, 0), 1)
+            cv2.line(frame, tuple(pts[1]), tuple(pts[3]), (255, 0, 0), 1)
+            # 再画矩形（绿色，在上方）
+            cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
+        # 红色目标点
+        if target_pt is not None:
+            cv2.circle(frame, (int(target_pt[0]), int(target_pt[1])), 8, (0, 0, 255), -1)
+
+        cv2.putText(frame, "state: {}".format(STATE_NAMES.get(state, state)), [w - 150, 30],
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        if target_pt is not None:
+            dx_s = int(target_pt[0] - w // 2)
+            dy_s = int(target_pt[1] - h // 2)
+            cv2.putText(frame, "send: dx=%+d dy=%+d" % (dx_s, dy_s),
+                        (5, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        # FPS 右下角
+        cv2.putText(frame, "fps: {}".format(round(fps, 2)), [w - 200, h - 10],
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
         streamer.update_frame(0, frame)
-        streamer.update_frame(1, rect.mask)
+        streamer.update_frame(1, td.mask)
 
         curr_time = time.time()
         fps = (1 / (curr_time - last_time) * 0.3 + fps * 0.7)
         last_time = curr_time
+
