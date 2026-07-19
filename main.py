@@ -2,7 +2,7 @@ import cv2
 from xbhdcc_tools import WebStreamer
 import time
 import os
-from white_rect_detector import WhiteRectDetector
+from target_detector import TargetDetector
 from serial_comm import SerialComm
 
 if __name__ == "__main__":
@@ -17,7 +17,7 @@ if __name__ == "__main__":
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     streamer = WebStreamer(port=8080)
-    rect = WhiteRectDetector()
+    rect = TargetDetector()
     serial_comm = SerialComm(port='/dev/ttyS7', baudrate=115200)
     fps = 0
     last_time = time.time()
