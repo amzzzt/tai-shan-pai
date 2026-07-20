@@ -92,6 +92,7 @@ class RectDetectorV2:
         self.prev_rw, self.prev_rh = 0, 0
         self.locked = False
         self.lock_miss = 0
+        self._smoothed = None  # EMA 平滑角点
 
         # 内部状态（调试/可视化用）
         self.debug_candidates = []
@@ -147,18 +148,15 @@ class RectDetectorV2:
 
         return quads
 
-    # ── 亚像素角点精化 ──
+    # ── 亚像素角点精化（轻量版，提帧率）──
     def _refine_corners(self, gray, corners):
-        """
-        license-plate LandmarkHead 思想 → 传统 cornerSubPix 实现亚像素
-        """
         try:
             refined = cv2.cornerSubPix(
                 gray,
                 corners.astype(np.float32),
-                winSize=(5, 5),
+                winSize=(3, 3),
                 zeroZone=(-1, -1),
-                criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.01)
+                criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 0.05)
             )
             return refined
         except cv2.error:
@@ -247,13 +245,12 @@ class RectDetectorV2:
                 if not fill_ok:
                     continue
 
-                # ── 多因素打分：填充质量最关键（区分标靶 vs 白墙）──
+                # ── 打分：只看填充质量+长宽比（不奖励大面积）──
                 rect = cv2.minAreaRect(corners)
                 rw, rh = rect[1]
                 ar = max(rw, rh) / max(min(rw, rh), 1)
                 ar_score = 1.0 - min(abs(ar - 1.46) / 0.5, 1.0)
-                area_score = min(area / (img_area * 0.02), 1.0)
-                score = fill_score * 0.40 + ar_score * 0.30 + area_score * 0.30
+                score = fill_score * 0.55 + ar_score * 0.45
 
                 if score > best_score:
                     best_score = score
@@ -266,6 +263,12 @@ class RectDetectorV2:
         # 3. 亚像素精化
         if best_corners is not None:
             best_corners = self._refine_corners(gray, best_corners)
+
+        # 3.5 EMA 平滑（丝滑跟随，减跳变）
+        if best_corners is not None:
+            if self._smoothed is not None:
+                best_corners = best_corners * 0.55 + self._smoothed * 0.45
+            self._smoothed = best_corners.copy()
 
         # 4. 追踪锁（比例制，自适应距离）
         if best_corners is not None:
