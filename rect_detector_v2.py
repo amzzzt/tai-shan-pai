@@ -115,7 +115,7 @@ class RectDetectorV2:
             approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
             n = len(approx)
 
-            # 3 顶点：远距小目标缺角 → 最长边中点补第 4 顶点
+            # 3 顶点 → 补角
             if n == 3:
                 pts = approx.reshape(3, 2)
                 edges = [(np.linalg.norm(pts[i] - pts[(i+1)%3]), i) for i in range(3)]
@@ -123,15 +123,20 @@ class RectDetectorV2:
                 j = (long_i + 1) % 3
                 mid = (pts[long_i] + pts[j]) / 2.0
                 pts = np.vstack([pts, mid.reshape(1, 2)])
-                approx = pts.reshape(4, 1, 2).astype(np.float32)
-                corners = approx.reshape(4, 2).astype(np.float32)
-                quads.append((corners, area))
+                corners = pts.astype(np.float32)
+                rect = cv2.minAreaRect(cnt)
+                rw, rh = rect[1]
+                area_ratio = area / max(rw * rh, 1)
+                quads.append((corners, area, area_ratio))
                 continue
 
             # 严格四边形
             if n == 4:
                 corners = approx.reshape(4, 2).astype(np.float32)
-                quads.append((corners, area))
+                rect = cv2.minAreaRect(cnt)
+                rw, rh = rect[1]
+                area_ratio = area / max(rw * rh, 1)
+                quads.append((corners, area, area_ratio))
                 continue
 
             # 5~8 边回退 minAreaRect
@@ -144,7 +149,8 @@ class RectDetectorV2:
                 if ar < 1.05 or ar > 2.0:
                     continue
                 corners = cv2.boxPoints(rect)
-                quads.append((corners, area))
+                area_ratio = area / max(rw * rh, 1)
+                quads.append((corners, area, area_ratio))
 
         return quads
 
@@ -201,9 +207,9 @@ class RectDetectorV2:
         mean_out = ring_sum / ring_cnt
 
         # 外环比内部明显暗 → 有黑边框 → 是标靶
-        if mean_out > mean_in * 0.82:
+        if mean_out > mean_in * 0.78:
             return False, 0.0
-        if dark_sides < 1:
+        if dark_sides < 2:
             return False, 0.0
 
         contrast = (mean_in - mean_out) / 255.0
@@ -238,19 +244,23 @@ class RectDetectorV2:
             quads.sort(key=lambda x: x[1], reverse=True)
             quads = quads[:8]
 
-            for corners, area in quads:
+            for corners, area, area_ratio in quads:
+                # 矩形完整度：缺角少边的色块面积比低
+                if area_ratio < 0.65:
+                    continue
                 if not is_valid_rect(corners, self.diag_tol, self.angle_tol):
                     continue
                 fill_ok, fill_score = self._check_fill(gray, corners, h, w)
                 if not fill_ok:
                     continue
 
-                # ── 打分：只看填充质量+长宽比（不奖励大面积）──
+                # ── 三项打分：填充 + 长宽比 + 矩形完整度 ──
                 rect = cv2.minAreaRect(corners)
                 rw, rh = rect[1]
                 ar = max(rw, rh) / max(min(rw, rh), 1)
                 ar_score = 1.0 - min(abs(ar - 1.46) / 0.5, 1.0)
-                score = fill_score * 0.55 + ar_score * 0.45
+                rect_score = min(area_ratio, 1.0)
+                score = fill_score * 0.40 + ar_score * 0.25 + rect_score * 0.35
 
                 if score > best_score:
                     best_score = score
@@ -260,12 +270,23 @@ class RectDetectorV2:
             if best_corners is not None:
                 break
 
-        # 3. 亚像素精化
+        # 3. 最低分门槛：杂景 fill≈0.2+AR≈0.5→0.335，标靶 fill≥0.2+AR≈0.9→0.515
+        if best_score < 0.40:
+            best_corners = None
+
         if best_corners is not None:
             best_corners = self._refine_corners(gray, best_corners)
 
-        # 3.5 EMA 平滑（丝滑跟随，减跳变）
+        # 3.5 角点排序 → [TL, TR, BR, BL]，永远周长顺序，杜绝沙漏形
         if best_corners is not None:
+            pts = best_corners
+            sy = pts[np.argsort(pts[:, 1])]
+            top, bot = sy[:2], sy[2:]
+            tl, tr = top[np.argsort(top[:, 0])]
+            bl, br = bot[np.argsort(bot[:, 0])]
+            best_corners = np.array([tl, tr, br, bl], dtype=np.float32)
+
+            # EMA 平滑
             if self._smoothed is not None:
                 best_corners = best_corners * 0.55 + self._smoothed * 0.45
             self._smoothed = best_corners.copy()
