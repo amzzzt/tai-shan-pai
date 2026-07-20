@@ -3,6 +3,7 @@ from xbhdcc_tools import WebStreamer
 import time
 import os
 from diag_rect_detector import DiagRectDetector
+from rect_detector_v2 import RectDetectorV2
 from serial_comm import SerialComm
 from scan_controller import ScanController
 
@@ -21,10 +22,12 @@ if __name__ == "__main__":
 
     streamer = WebStreamer(port=8080)
     td = DiagRectDetector()
+    rd_v2 = RectDetectorV2()
     sc = SerialComm(port='/dev/ttyS7', baudrate=115200)
     scan = ScanController(td, sc)
 
     fps = 0
+    frame_cnt = 0
     last_time = time.time()
 
     while True:
@@ -34,7 +37,20 @@ if __name__ == "__main__":
         frame = cv2.flip(frame, 0)
         h, w = frame.shape[:2]
 
-        td.detect(frame)
+        # 隔帧检测 + rd_v2 优先（几何验证更严格）
+        if frame_cnt % 2 == 0:
+            rd_v2.detect(frame)
+            if rd_v2.found:
+                td.found = True
+                td.cx, td.cy = rd_v2.cx, rd_v2.cy
+                td.dx, td.dy = rd_v2.dx, rd_v2.dy
+                td.inner_pts = rd_v2.inner_pts
+                td.outer_pts = rd_v2.outer_pts
+                td.mid_pts = rd_v2.mid_pts
+                td.mask = rd_v2.mask
+            else:
+                td.detect(frame)
+        frame_cnt += 1
         target_pt, state = scan.update(h, w)
 
         # 中心十字 + 内部绿色矩形框
