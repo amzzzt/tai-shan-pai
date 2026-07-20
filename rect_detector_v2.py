@@ -310,7 +310,13 @@ class RectDetectorV2:
 
             self.inner_pts = best_corners.astype(np.int32)
             ow, oh = iw * self.scale, ih * self.scale
-            self.outer_pts = cv2.boxPoints(((icx, icy), (ow, oh), angle)).astype(np.int32)
+            outer_raw = cv2.boxPoints(((icx, icy), (ow, oh), angle))
+            # 排序 outer_pts 与 inner_pts [TL,TR,BR,BL] 对齐
+            sy_o = outer_raw[np.argsort(outer_raw[:, 1])]
+            top_o, bot_o = sy_o[:2], sy_o[2:]
+            tl_o, tr_o = top_o[np.argsort(top_o[:, 0])]
+            bl_o, br_o = bot_o[np.argsort(bot_o[:, 0])]
+            self.outer_pts = np.array([tl_o, tr_o, br_o, bl_o], dtype=np.int32)
 
             # 中点计算（外扩一点点，向框外偏3像素）
             self.mid_pts = ((self.outer_pts.astype(float) + self.inner_pts.astype(float)) * 0.5)
