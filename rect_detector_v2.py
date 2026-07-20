@@ -67,50 +67,6 @@ def is_valid_rect(corners, diag_tol=0.12, angle_tol=10.0, min_side=10):
     return True
 
 
-def nms_rects(rects, iou_thresh=0.3):
-    """
-    license-plate 风格 NMS 去重
-    rects: [(corners_4x2, area, score), ...]
-    """
-    if len(rects) <= 1:
-        return rects
-
-    # 按 score 降序
-    rects = sorted(rects, key=lambda r: r[2], reverse=True)
-    keep = []
-
-    for i, (ci, ai, si) in enumerate(rects):
-        kept = True
-        for (ck, ak, _) in keep:
-            # 用 minAreaRect 的旋转框计算 IoU
-            ri = cv2.minAreaRect(ci.astype(np.float32))
-            rk = cv2.minAreaRect(ck.astype(np.float32))
-            iou = _rotated_iou(ri, rk, ai, ak)
-            if iou > iou_thresh:
-                kept = False
-                break
-        if kept:
-            keep.append((ci, ai, si))
-
-    return keep
-
-
-def _rotated_iou(r1, r2, a1, a2):
-    """旋转框 IoU 估算（用面积比替代，泰山派上避免 cv2.rotatedRectangleIntersection 可能缺失）"""
-    # 简化版：中心距离 + 面积比
-    c1, c2 = np.array(r1[0]), np.array(r2[0])
-    dist = np.linalg.norm(c1 - c2)
-    avg_size = (np.sqrt(a1) + np.sqrt(a2)) / 2
-    if dist > avg_size * 0.8:
-        return 0.0
-    # 重叠面积估算
-    overlap = (avg_size - dist) ** 2
-    union = a1 + a2 - overlap
-    if union < 1:
-        return 0.0
-    return overlap / union
-
-
 # ═══════════════════════════════════════════════════════════
 #  主检测器
 # ═══════════════════════════════════════════════════════════
@@ -126,10 +82,10 @@ class RectDetectorV2:
         self.mid_pts = None
         self.mask = None
         self.scale = 1.17          # 外框/内框比例
-        self.diag_tol = 0.12       # 对角线等长容差
-        self.angle_tol = 10.0      # 邻边垂直容差 (度)
-        self.min_area_ratio = 1/30 # 最小面积占图像比
-        self.max_area_ratio = 1/3  # 最大面积占图像比
+        self.diag_tol = 0.15       # 对角线等长容差
+        self.angle_tol = 18.0      # 邻边垂直容差（包容桶形畸变）
+        self.min_area_ratio = 1/300 # 最小面积占图像比（2m+ 可过）
+        self.max_area_ratio = 0.85  # 最大面积占图像比（包容近距离）
 
         # 追踪锁
         self.prev_cx, self.prev_cy = 0, 0
@@ -143,10 +99,6 @@ class RectDetectorV2:
 
     # ── K230 风格: DP 多边形逼近 + 四边形筛选 ──
     def _find_quads_dp(self, mask, img_area):
-        """
-        对 mask 做轮廓查找 → approxPolyDP → 四边形筛选
-        返回 [(corners_4x2, area), ...]
-        """
         min_a = img_area * self.min_area_ratio
         max_a = img_area * self.max_area_ratio
 
@@ -157,10 +109,23 @@ class RectDetectorV2:
             if area < min_a or area > max_a:
                 continue
 
-            # Douglas-Peucker 逼近
+            # Douglas-Peucker 逼近（放宽精度适应远距+畸变）
             peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
             n = len(approx)
+
+            # 3 顶点：远距小目标缺角 → 最长边中点补第 4 顶点
+            if n == 3:
+                pts = approx.reshape(3, 2)
+                edges = [(np.linalg.norm(pts[i] - pts[(i+1)%3]), i) for i in range(3)]
+                _, long_i = max(edges, key=lambda x: x[0])
+                j = (long_i + 1) % 3
+                mid = (pts[long_i] + pts[j]) / 2.0
+                pts = np.vstack([pts, mid.reshape(1, 2)])
+                approx = pts.reshape(4, 1, 2).astype(np.float32)
+                corners = approx.reshape(4, 2).astype(np.float32)
+                quads.append((corners, area))
+                continue
 
             # 严格四边形
             if n == 4:
@@ -172,21 +137,15 @@ class RectDetectorV2:
             if 5 <= n <= 8:
                 rect = cv2.minAreaRect(cnt)
                 rw, rh = rect[1]
-                if rw < 10 or rh < 10:
+                if rw < 4 or rh < 4:
                     continue
                 ar = max(rw, rh) / max(min(rw, rh), 1)
-                if ar < 1.15 or ar > 1.85:
+                if ar < 1.05 or ar > 2.0:
                     continue
                 corners = cv2.boxPoints(rect)
                 quads.append((corners, area))
 
         return quads
-
-    # ── license-plate 风格: 对候选按面积打分 + NMS ──
-    def _score_and_nms(self, quads):
-        """给候选打分（面积接近图像某比例最好），然后 NMS"""
-        scored = [(c, a, a) for c, a in quads]  # 面积即分数
-        return nms_rects(scored, iou_thresh=0.3)
 
     # ── 亚像素角点精化 ──
     def _refine_corners(self, gray, corners):
@@ -205,22 +164,53 @@ class RectDetectorV2:
         except cv2.error:
             return corners
 
-    # ── 填充验证：确保矩形内部是实心白色（回字靶特征）──
-    def _check_fill(self, gray, mask, corners, tval, h, w):
+    # ── 填充验证：内部白 + 外环暗（标靶 vs 白墙的关键区分）──
+    def _check_fill(self, gray, corners, h, w):
         inner = np.zeros((h, w), dtype=np.uint8)
         cv2.fillPoly(inner, [corners.astype(np.int32)], 255)
         total = cv2.countNonZero(inner)
-        if total < 100:
-            return False
-        # mask 中白色占比
-        white = cv2.countNonZero(cv2.bitwise_and(mask, inner))
-        if white / total < 0.6:
-            return False
-        # 灰度亮度
-        bright = (gray[inner == 255] > tval).sum() / max(total, 1)
-        if bright < 0.5:
-            return False
-        return True
+        if total < 30:
+            return False, 0.0
+
+        mean_in = float(gray[inner == 255].mean())
+        if mean_in < 35:
+            return False, 0.0
+
+        # ── 外环暗度：自适应环宽，检查黑边框 ──
+        cr, (wr, hr), ar = cv2.minAreaRect(corners)
+        ring = max(3.0, min(14.0, max(wr, hr) * 0.25))
+        outer = cv2.boxPoints((cr, (wr + ring, hr + ring), ar)).astype(np.int32)
+        i_r   = cv2.boxPoints((cr, (wr, hr), ar)).astype(np.int32)
+
+        ring_sum, ring_cnt = 0.0, 0
+        dark_sides = 0
+        for side in range(4):
+            seg = np.zeros((h, w), dtype=np.uint8)
+            pts = np.array([outer[side], outer[(side+1)%4],
+                            i_r[(side+1)%4], i_r[side]], dtype=np.int32)
+            cv2.fillPoly(seg, [pts], 255)
+            sp = cv2.countNonZero(seg)
+            if sp > 4:
+                m = float(gray[seg == 255].mean())
+                ring_sum += m * sp
+                ring_cnt += sp
+                if m < mean_in * 0.80:
+                    dark_sides += 1
+
+        if ring_cnt == 0:
+            return False, 0.0
+
+        mean_out = ring_sum / ring_cnt
+
+        # 外环比内部明显暗 → 有黑边框 → 是标靶
+        if mean_out > mean_in * 0.82:
+            return False, 0.0
+        if dark_sides < 1:
+            return False, 0.0
+
+        contrast = (mean_in - mean_out) / 255.0
+        score = max(0.2, min(contrast / 0.35, 1.0))
+        return True, score
 
     # ── 主检测 ──
     def detect(self, frame):
@@ -228,16 +218,16 @@ class RectDetectorV2:
         cx0, cy0 = w // 2, h // 2
         img_area = h * w
 
-        # 1. 预处理（缩小形态学核提帧率）
+        # 1. 预处理
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         tval = float(cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[0])
 
         best_corners = None
-        best_score = 0
+        best_score = 0.0
         self.mask = None
 
-        # 2. Otsu 正反两路（第一路有好结果就跳过第二路）
+        # 2. Otsu 正反两路（第一路找到就跳过）
         for tv in [tval, 255 - tval]:
             mask = cv2.threshold(gray, tv, 255, cv2.THRESH_BINARY)[1]
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
@@ -247,39 +237,46 @@ class RectDetectorV2:
             if not quads:
                 continue
 
-            # 只对面积 top-8 做后续验证（省 _check_fill）
             quads.sort(key=lambda x: x[1], reverse=True)
             quads = quads[:8]
 
             for corners, area in quads:
-                # pyzbar 几何验证（只在这里跑一次）
                 if not is_valid_rect(corners, self.diag_tol, self.angle_tol):
                     continue
-                # 填充验证（最贵的检查，放最后）
-                if not self._check_fill(gray, mask, corners, tval, h, w):
+                fill_ok, fill_score = self._check_fill(gray, corners, h, w)
+                if not fill_ok:
                     continue
-                if area > best_score:
-                    best_score = area
+
+                # ── 多因素打分：填充质量最关键（区分标靶 vs 白墙）──
+                rect = cv2.minAreaRect(corners)
+                rw, rh = rect[1]
+                ar = max(rw, rh) / max(min(rw, rh), 1)
+                ar_score = 1.0 - min(abs(ar - 1.46) / 0.5, 1.0)
+                area_score = min(area / (img_area * 0.02), 1.0)
+                score = fill_score * 0.40 + ar_score * 0.30 + area_score * 0.30
+
+                if score > best_score:
+                    best_score = score
                     best_corners = corners
                     self.mask = mask
 
-            # 第一路找到就跳过第二路
             if best_corners is not None:
                 break
 
-        # 3. 亚像素精化（仅对大目标做，小目标收益低）
+        # 3. 亚像素精化
         if best_corners is not None:
             best_corners = self._refine_corners(gray, best_corners)
 
-        # 4. 追踪锁（位置 + 尺寸 双重门槛）
+        # 4. 追踪锁（比例制，自适应距离）
         if best_corners is not None:
             pts = best_corners.astype(np.float32)
             cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
             cr, (rw, rh), _ = cv2.minAreaRect(best_corners)
             if self.locked:
                 dist = np.sqrt((cx - self.prev_cx)**2 + (cy - self.prev_cy)**2)
+                max_move = max(self.prev_rw, self.prev_rh) * 1.2
                 size_chg = abs(rw * rh - self.prev_rw * self.prev_rh) / max(self.prev_rw * self.prev_rh, 1)
-                if dist > 120 or size_chg > 0.5:
+                if dist > max_move or size_chg > 0.7:
                     best_corners = None
 
         # 5. 更新状态
