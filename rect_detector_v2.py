@@ -85,7 +85,7 @@ class RectDetectorV2:
         self.diag_tol = 0.15       # 对角线等长容差
         self.angle_tol = 18.0      # 邻边垂直容差（包容桶形畸变）
         self.min_area_ratio = 1/300 # 最小面积占图像比（2m+ 可过）
-        self.max_area_ratio = 0.85  # 最大面积占图像比（包容近距离）
+        self.max_area_ratio = 0.5   # 标靶最大不超过半屏
 
         # 追踪锁
         self.prev_cx, self.prev_cy = 0, 0
@@ -277,7 +277,7 @@ class RectDetectorV2:
         if best_corners is not None:
             best_corners = self._refine_corners(gray, best_corners)
 
-        # 3.5 角点排序 → [TL, TR, BR, BL]，永远周长顺序，杜绝沙漏形
+        # 3.5 角点排序
         if best_corners is not None:
             pts = best_corners
             sy = pts[np.argsort(pts[:, 1])]
@@ -286,21 +286,21 @@ class RectDetectorV2:
             bl, br = bot[np.argsort(bot[:, 0])]
             best_corners = np.array([tl, tr, br, bl], dtype=np.float32)
 
-            # EMA 平滑
+            # EMA 轻量平滑
             if self._smoothed is not None:
-                best_corners = best_corners * 0.55 + self._smoothed * 0.45
+                best_corners = best_corners * 0.8 + self._smoothed * 0.2
             self._smoothed = best_corners.copy()
 
-        # 4. 追踪锁（比例制，自适应距离）
+        # 4. 追踪锁（宽松，不卡框）
         if best_corners is not None:
             pts = best_corners.astype(np.float32)
             cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
             cr, (rw, rh), _ = cv2.minAreaRect(best_corners)
             if self.locked:
                 dist = np.sqrt((cx - self.prev_cx)**2 + (cy - self.prev_cy)**2)
-                max_move = max(self.prev_rw, self.prev_rh) * 1.2
+                max_move = max(self.prev_rw, self.prev_rh) * 2.0
                 size_chg = abs(rw * rh - self.prev_rw * self.prev_rh) / max(self.prev_rw * self.prev_rh, 1)
-                if dist > max_move or size_chg > 0.7:
+                if dist > max_move or size_chg > 0.85:
                     best_corners = None
 
         # 5. 更新状态
