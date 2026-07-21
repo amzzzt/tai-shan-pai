@@ -1,8 +1,10 @@
 import cv2
+import numpy as np
 from xbhdcc_tools import WebStreamer
 import time
 import os
 from rect_detector_v2 import RectDetectorV2
+from circle_tracker import CircleTracker
 from serial_comm import SerialComm
 
 if __name__ == "__main__":
@@ -17,11 +19,13 @@ if __name__ == "__main__":
 
     streamer = WebStreamer(port=8080)
     rd = RectDetectorV2()
+    ct = CircleTracker(rd)
     sc = SerialComm(port='/dev/ttyS7', baudrate=115200)
 
     fps = 0
     last_time = time.time()
-    confirm = 0  # 连续确认计数
+    confirm = 0
+    ct_started = False
 
     while True:
         ret, frame = cap.read()
@@ -32,7 +36,6 @@ if __name__ == "__main__":
 
         rd.detect(frame)
 
-        # 连续 2 帧检测到才确认，滤偶发跳变
         if rd.found:
             confirm += 1
         else:
@@ -40,22 +43,46 @@ if __name__ == "__main__":
 
         confirmed = confirm >= 2
 
-        # 发偏差
-        if confirmed:
-            sc.send_error(rd.dx, rd.dy, True)
+        # 确认后启动圆形追踪（只启动一次，丢帧不重置）
+        if confirmed and not ct_started:
+            ct.start(period=30.0, n_points=72)
+            ct_started = True
+
+        # 获取圆形路径当前点（即使丢帧也按时间推进）
+        ct_pt = ct.update(h, w) if ct_started else None
+
+        # 发偏差：只跟红圈
+        if ct_pt is not None:
+            _, _, dx, dy = ct_pt
+            sc.send_error(dx, dy, True)
         else:
             sc.send_error(0, 0, False)
 
-        # 中心十字
+        # ── 绘制 ──
         cv2.line(frame, (w//2-15, h//2), (w//2+15, h//2), (255,255,255), 2)
         cv2.line(frame, (w//2, h//2-15), (w//2, h//2+15), (255,255,255), 2)
 
         if confirmed and rd.inner_pts is not None:
+            # 绿色矩形框
             cv2.polylines(frame, [rd.inner_pts], True, (0, 255, 0), 2)
             cv2.line(frame, tuple(rd.inner_pts[0]), tuple(rd.inner_pts[2]), (255,0,0), 1)
             cv2.line(frame, tuple(rd.inner_pts[1]), tuple(rd.inner_pts[3]), (255,0,0), 1)
+
+            # 圆形路径（青色虚线圆）
+            if ct.points:
+                pts_int = [(int(p[0]), int(p[1])) for p in ct.points]
+                for i in range(len(pts_int)):
+                    cv2.circle(frame, pts_int[i], 1, (255, 255, 0), -1)
+
+            # 中心红点
             cv2.circle(frame, (rd.cx, rd.cy), 5, (0, 0, 255), -1)
-            cv2.putText(frame, "dx=%+d dy=%+d" % (rd.dx, rd.dy),
+
+        # 圆形路径上的移动红点
+        if ct_pt is not None:
+            px, py, dx, dy = ct_pt
+            cv2.circle(frame, (int(px), int(py)), 8, (0, 0, 255), -1)
+            cv2.circle(frame, (int(px), int(py)), 10, (0, 0, 255), 2)
+            cv2.putText(frame, "CT: dx=%+d dy=%+d" % (dx, dy),
                         (5, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         else:
             cv2.putText(frame, "No target", (5, 50),
