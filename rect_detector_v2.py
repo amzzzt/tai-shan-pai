@@ -83,13 +83,15 @@ class RectDetectorV2:
         self.mask = None
         self.scale = 1.17          # 外框/内框比例
         self.diag_tol = 0.15       # 对角线等长容差
-        self.angle_tol = 18.0      # 邻边垂直容差（包容桶形畸变）
+        self.angle_tol = 12.0      # 邻边垂直容差
         self.min_area_ratio = 1/300 # 最小面积占图像比（2m+ 可过）
         self.max_area_ratio = 0.5   # 标靶最大不超过半屏
 
         # 追踪锁
         self.prev_cx, self.prev_cy = 0, 0
         self.prev_rw, self.prev_rh = 0, 0
+        self.prev_ar = 0
+        self.prev_angle = 0
         self.locked = False
         self.lock_miss = 0
         self._smoothed = None  # EMA 平滑角点
@@ -110,9 +112,18 @@ class RectDetectorV2:
             if area < min_a or area > max_a:
                 continue
 
+            # 凸性检查：凹进去的轮廓直接拒（面积 / 凸包面积 < 0.80）
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            if hull_area > 0 and area / hull_area < 0.80:
+                continue
+
             # Douglas-Peucker 逼近（放宽精度适应远距+畸变）
             peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+            # 严格逼近：直边 4 顶，弯边炸出很多顶点
+            approx_strict = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            n_strict = len(approx_strict)
             n = len(approx)
 
             # 3 顶点 → 补角
@@ -127,7 +138,8 @@ class RectDetectorV2:
                 rect = cv2.minAreaRect(cnt)
                 rw, rh = rect[1]
                 area_ratio = area / max(rw * rh, 1)
-                quads.append((corners, area, area_ratio))
+                peri_ratio = peri / (2*(rw+rh)) if (rw+rh) > 0 else 9
+                quads.append((corners, area, area_ratio, peri_ratio, n_strict))
                 continue
 
             # 严格四边形
@@ -136,7 +148,8 @@ class RectDetectorV2:
                 rect = cv2.minAreaRect(cnt)
                 rw, rh = rect[1]
                 area_ratio = area / max(rw * rh, 1)
-                quads.append((corners, area, area_ratio))
+                peri_ratio = peri / (2*(rw+rh)) if (rw+rh) > 0 else 9
+                quads.append((corners, area, area_ratio, peri_ratio, n_strict))
                 continue
 
             # 5~8 边回退 minAreaRect
@@ -150,7 +163,8 @@ class RectDetectorV2:
                     continue
                 corners = cv2.boxPoints(rect)
                 area_ratio = area / max(rw * rh, 1)
-                quads.append((corners, area, area_ratio))
+                peri_ratio = peri / (2*(rw+rh)) if (rw+rh) > 0 else 9
+                quads.append((corners, area, area_ratio, peri_ratio, n_strict))
 
         return quads
 
@@ -169,7 +183,7 @@ class RectDetectorV2:
             return corners
 
     # ── 填充验证：内部白 + 外环暗（标靶 vs 白墙的关键区分）──
-    def _check_fill(self, gray, corners, h, w):
+    def _check_fill(self, gray, corners, h, w, strict=False):
         inner = np.zeros((h, w), dtype=np.uint8)
         cv2.fillPoly(inner, [corners.astype(np.int32)], 255)
         total = cv2.countNonZero(inner)
@@ -209,7 +223,8 @@ class RectDetectorV2:
         # 外环比内部明显暗 → 有黑边框 → 是标靶
         if mean_out > mean_in * 0.78:
             return False, 0.0
-        if dark_sides < 2:
+        need_dark = 3 if strict else 2
+        if dark_sides < need_dark:
             return False, 0.0
 
         contrast = (mean_in - mean_out) / 255.0
@@ -236,6 +251,8 @@ class RectDetectorV2:
             mask = cv2.threshold(gray, tv, 255, cv2.THRESH_BINARY)[1]
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+            if self.mask is None:
+                self.mask = mask  # 始终有 mask 可显示
 
             quads = self._find_quads_dp(mask, img_area)
             if not quads:
@@ -244,23 +261,45 @@ class RectDetectorV2:
             quads.sort(key=lambda x: x[1], reverse=True)
             quads = quads[:8]
 
-            for corners, area, area_ratio in quads:
-                # 矩形完整度：缺角少边的色块面积比低
+            for corners, area, area_ratio, peri_ratio, n_strict in quads:
+                # 边界排除：角点离画面边缘 < 5px → 残影，拒
+                if (corners[:,0].min() < 5 or corners[:,0].max() > w - 5 or
+                    corners[:,1].min() < 5 or corners[:,1].max() > h - 5):
+                    continue
+                # 严格逼近顶点数：直边 ≈4，弯边炸出 >6
+                if n_strict > 6:
+                    continue
+                if peri_ratio > 1.30:
+                    continue
                 if area_ratio < 0.65:
                     continue
                 if not is_valid_rect(corners, self.diag_tol, self.angle_tol):
                     continue
-                fill_ok, fill_score = self._check_fill(gray, corners, h, w)
+                fill_ok, fill_score = self._check_fill(gray, corners, h, w, strict=self.locked)
                 if not fill_ok:
                     continue
 
-                # ── 三项打分：填充 + 长宽比 + 矩形完整度 ──
+                # ── 角度质量：灯 bloom 四个角远偏离 90° ──
+                angles = rect_angle(corners)
+                angle_dev = sum(abs(a - 90) for a in angles) / 4.0
+                angle_quality = max(0.0, 1.0 - angle_dev / 12.0)
+                if angle_quality < 0.25:  # 太不像矩形，直接拒
+                    continue
+
+                # ── 五项打分 ──
                 rect = cv2.minAreaRect(corners)
-                rw, rh = rect[1]
+                (cx_r, cy_r), (rw, rh), _ = rect
                 ar = max(rw, rh) / max(min(rw, rh), 1)
                 ar_score = 1.0 - min(abs(ar - 1.46) / 0.5, 1.0)
                 rect_score = min(area_ratio, 1.0)
-                score = fill_score * 0.40 + ar_score * 0.25 + rect_score * 0.35
+
+                if self.locked:
+                    dist = np.sqrt((cx_r - self.prev_cx)**2 + (cy_r - self.prev_cy)**2)
+                    max_move = max(self.prev_rw, self.prev_rh) * 2.0
+                    pos_score = max(0, 1.0 - dist / max_move) if max_move > 0 else 0
+                    score = fill_score*0.20 + ar_score*0.15 + rect_score*0.15 + angle_quality*0.20 + pos_score*0.30
+                else:
+                    score = fill_score*0.28 + ar_score*0.20 + rect_score*0.22 + angle_quality*0.30
 
                 if score > best_score:
                     best_score = score
@@ -270,8 +309,9 @@ class RectDetectorV2:
             if best_corners is not None:
                 break
 
-        # 3. 最低分门槛：杂景 fill≈0.2+AR≈0.5→0.335，标靶 fill≥0.2+AR≈0.9→0.515
-        if best_score < 0.40:
+        # 3. 最低分门槛（锁定后更严，防背景误入）
+        threshold = 0.35 if self.locked else 0.45
+        if best_score < threshold:
             best_corners = None
 
         if best_corners is not None:
@@ -298,9 +338,11 @@ class RectDetectorV2:
             cr, (rw, rh), _ = cv2.minAreaRect(best_corners)
             if self.locked:
                 dist = np.sqrt((cx - self.prev_cx)**2 + (cy - self.prev_cy)**2)
-                max_move = max(self.prev_rw, self.prev_rh) * 2.0
+                max_move = max(self.prev_rw, self.prev_rh) * 0.8
                 size_chg = abs(rw * rh - self.prev_rw * self.prev_rh) / max(self.prev_rw * self.prev_rh, 1)
-                if dist > max_move or size_chg > 0.85:
+                ar_cur = max(rw, rh) / max(min(rw, rh), 1)
+                ar_chg = abs(ar_cur - self.prev_ar)
+                if dist > max_move or size_chg > 0.4 or ar_chg > 0.30:
                     best_corners = None
 
         # 5. 更新状态
@@ -335,6 +377,8 @@ class RectDetectorV2:
             self.locked = True
             self.prev_cx, self.prev_cy = self.cx, self.cy
             self.prev_rw, self.prev_rh = iw, ih
+            self.prev_ar = max(iw, ih) / max(min(iw, ih), 1)
+            self.prev_angle = angle
         else:
             self.found = False
             self.lock_miss += 1
