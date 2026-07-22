@@ -3,6 +3,7 @@ import numpy as np
 from xbhdcc_tools import WebStreamer
 import time
 import os
+from xbhdcc_spi_lcd import ST7735Streamer
 from rect_detector_v2 import RectDetectorV2
 from circle_tracker import CircleTracker
 from serial_comm import SerialComm
@@ -21,6 +22,7 @@ if __name__ == "__main__":
     rd = RectDetectorV2()
     ct = CircleTracker(rd)
     sc = SerialComm(port='/dev/ttyS7', baudrate=115200)
+    lcd = ST7735Streamer()
 
     fps = 0
     last_time = time.time()
@@ -92,6 +94,7 @@ if __name__ == "__main__":
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
         streamer.update_frame(0, frame)
+        lcd.update_frame(frame)
         if rd.mask is not None:
             streamer.update_frame(1, rd.mask)
 
