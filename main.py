@@ -4,6 +4,7 @@ from xbhdcc_tools import WebStreamer
 import time
 import os
 from xbhdcc_spi_lcd import ST7735Streamer
+from gpio_button import GpioButton
 from rect_detector_v2 import RectDetectorV2
 from circle_tracker import CircleTracker
 from serial_comm import SerialComm
@@ -23,6 +24,12 @@ if __name__ == "__main__":
     ct = CircleTracker(rd)
     sc = SerialComm(port='/dev/ttyS7', baudrate=115200)
     lcd = ST7735Streamer()
+
+    # ── GPIO 按键：按一下显示/关闭 FPS ──
+    # 引脚配置: 传数字编号或 "GPIO3_A1" 字符串均可
+    # 接线: 按键一脚接 GPIO3_A1(TN 物理 40Pin 左侧第 36 脚)，另一脚接 3.3V
+    btn = GpioButton(97)   # 97 = GPIO3_A1
+    show_fps = False
 
     fps = 0
     last_time = time.time()
@@ -90,11 +97,12 @@ if __name__ == "__main__":
             cv2.putText(frame, "No target", (5, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        cv2.putText(frame, "fps: %.1f" % fps, (w-150, h-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        # GPIO 按键：按一下切换 FPS 显示
+        if btn.update():
+            show_fps = not show_fps
 
         streamer.update_frame(0, frame)
-        lcd.update_frame(frame)
+        lcd.update_frame(frame, overlay=("FPS:%.1f" % fps) if show_fps else None)
         if rd.mask is not None:
             streamer.update_frame(1, rd.mask)
 
