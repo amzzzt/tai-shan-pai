@@ -13,7 +13,7 @@ if __name__ == "__main__":
     os.system("fuser -k 8080/tcp /dev/video9 2>/dev/null")
     time.sleep(0.5)
 
-    cap = cv2.VideoCapture(9, cv2.CAP_V4L2)
+    cap = cv2.VideoCapture(10, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -22,14 +22,32 @@ if __name__ == "__main__":
     streamer = WebStreamer(port=8080)
     rd = RectDetectorV2()
     ct = CircleTracker(rd)
-    sc = SerialComm(port='/dev/ttyS7', baudrate=115200)
-    lcd = ST7735Streamer()
 
-    # ── GPIO 按键：按一下显示/关闭 FPS ──
-    # 引脚配置: 传数字编号或 "GPIO3_A1" 字符串均可
-    # 接线: 按键一脚接 GPIO3_A1(TN 物理 40Pin 左侧第 36 脚)，另一脚接 3.3V
-    btn = GpioButton(97)   # 97 = GPIO3_A1
-    show_fps = False
+    # 串口（未接则降级为 dummy）
+    try:
+        sc = SerialComm(port='/dev/ttyS3', baudrate=115200)
+    except Exception as e:
+        print(f"[main] 串口打开失败 ({e})，使用 dummy 模式")
+        sc = None
+
+    # SPI LCD（未接则降级为 dummy）
+    try:
+        lcd = ST7735Streamer()
+    except Exception as e:
+        print(f"[main] SPI LCD 打开失败 ({e})，使用 dummy 模式")
+        lcd = None
+
+    # ── GPIO 按键：长按 2 秒 暂停/恢复 ──
+    # 接线: 按键一脚接 GPIO3_A1，另一脚接 3.3V
+    try:
+        btn = GpioButton(97)   # 97 = GPIO3_A1
+    except Exception as e:
+        print(f"[main] GPIO 打开失败 ({e})，按键功能禁用")
+        btn = None
+    paused = False
+    hold_frames = 0            # 长按计数
+    HOLD_THRESHOLD = 60        # 长按阈值（约2秒@30fps）
+    HOLD_COOLDOWN = 30         # 触发后冷却，防重复触发
 
     fps = 0
     last_time = time.time()
@@ -60,12 +78,40 @@ if __name__ == "__main__":
         # 获取圆形路径当前点（即使丢帧也按时间推进）
         ct_pt = ct.update(h, w) if ct_started else None
 
+        # ── 长按检测：按住 2 秒 暂停/恢复 ──
+        if btn and btn.raw():
+            hold_frames += 1
+            if hold_frames == HOLD_THRESHOLD:
+                paused = not paused
+                print(f"[main] {'暂停' if paused else '恢复'}追踪")
+                hold_frames = -HOLD_COOLDOWN  # 冷却，防重复触发
+        else:
+            hold_frames = max(hold_frames, 0)  # 松开归零，但不低于冷却值
+            if hold_frames < 0:
+                hold_frames += 1
+
+        if paused:
+            # 暂停时只推流，不追踪不发串口
+            cv2.putText(frame, "PAUSED", (w//2-50, h-30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            streamer.update_frame(0, frame)
+            if lcd:
+                lcd.update_frame(frame)
+            if rd.mask is not None:
+                streamer.update_frame(1, rd.mask)
+            curr_time = time.time()
+            fps = (1/(curr_time-last_time))*0.3 + fps*0.7
+            last_time = curr_time
+            continue
+
         # 发偏差：只跟红圈
         if ct_pt is not None:
             _, _, dx, dy = ct_pt
-            sc.send_error(dx, dy, True)
+            if sc:
+                sc.send_error(dx, dy, True)
         else:
-            sc.send_error(0, 0, False)
+            if sc:
+                sc.send_error(0, 0, False)
 
         # ── 绘制 ──
         cv2.line(frame, (w//2-15, h//2), (w//2+15, h//2), (255,255,255), 2)
@@ -97,12 +143,13 @@ if __name__ == "__main__":
             cv2.putText(frame, "No target", (5, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        # GPIO 按键：按一下切换 FPS 显示
-        if btn.update():
-            show_fps = not show_fps
+        # FPS 直接画在画面左上角
+        cv2.putText(frame, "FPS:%.1f" % fps, (5, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         streamer.update_frame(0, frame)
-        lcd.update_frame(frame, overlay=("FPS:%.1f" % fps) if show_fps else None)
+        if lcd:
+            lcd.update_frame(frame)
         if rd.mask is not None:
             streamer.update_frame(1, rd.mask)
 
