@@ -142,8 +142,9 @@ class ST7735Streamer:
         self._send_command(0x29)  # DISPON
         time.sleep(0.1)
 
-    def update_frame(self, img, skip=2):
-        """传入任意尺寸的 OpenCV BGR 图像，自动缩放并推送到屏幕 (隔 skip 帧刷一次)"""
+    def update_frame(self, img, skip=2, overlay=None):
+        """传入任意尺寸的 OpenCV BGR 图像，自动缩放并推送到屏幕 (隔 skip 帧刷一次)
+           overlay: 可选字符串，画在屏幕左上角（如 FPS）"""
         self._frame_cnt += 1
         if self._frame_cnt % (skip + 1) != 0:
             return
@@ -154,7 +155,12 @@ class ST7735Streamer:
         # 1. 缩放到原生分辨率 128x160
         img_resized = cv2.resize(img, (self.W, self.H))
 
-        # 2. BGR 转 RGB565 并处理字节序
+        # 2. 叠加文字（原生分辨率，保证清晰可见）
+        if overlay:
+            cv2.putText(img_resized, overlay, (2, 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+
+        # 3. BGR 转 RGB565 并处理字节序
         img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
         R = (img_rgb[..., 0] >> 3).astype(np.uint16) << 11
         G = (img_rgb[..., 1] >> 2).astype(np.uint16) << 5

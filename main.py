@@ -30,9 +30,8 @@ if __name__ == "__main__":
 
     fps = 0
     last_time = time.time()
-    calibrate = True  # 校准模式: 画同心圆帮你确定球的尺寸和范围
+    calibrate = True
 
-    # 同心圆半径和Y边界线 (在校准模式下显示)
     calib_radii = [10, 20, 30, 40, 50, 60, 80, 100]
     calib_y_lines = [20, 40, 60]
 
@@ -40,10 +39,9 @@ if __name__ == "__main__":
         ret, frame = cap.read()
         if not ret:
             continue
-        frame = cv2.flip(frame, -1)  # 上下+左右翻转
-        frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)  # 逆时针90度
-        frame = cv2.flip(frame, 1)  # 以Y轴镜像翻转, 左右对调
-        # 截取Y轴中心±70水平带, 其余丢弃
+        frame = cv2.flip(frame, -1)
+        frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        frame = cv2.flip(frame, 1)
         cy_full = frame.shape[0] // 2
         frame = frame[cy_full - 70:cy_full + 70, :]
         h, w = frame.shape[:2]
@@ -51,11 +49,9 @@ if __name__ == "__main__":
 
         bd.detect(frame)
 
-        # ── 串口发送偏差 ──
         if sc:
             sc.send_error(bd.dx, bd.dy, bd.found)
 
-        # ── 校准同心圆 ──
         if calibrate:
             for r in calib_radii:
                 cv2.circle(frame, (cx0, cy0), r, (255, 255, 255), 1)
@@ -67,7 +63,6 @@ if __name__ == "__main__":
                 cv2.putText(frame, "y=+-%d" % yb, (5, cy0 + yb - 3),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
 
-        # ── 绘制 ──
         if bd.found:
             cv2.circle(frame, (bd.cx, bd.cy), int(bd.radius), (0, 255, 0), 2)
             cv2.circle(frame, (bd.cx, bd.cy), 5, (0, 0, 255), -1)

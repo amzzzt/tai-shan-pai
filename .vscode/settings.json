@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "/usr/bin/python3",
+    "python.terminal.activateEnvironment": false,
+    "python.languageServer": "Jedi",
+    "python.analysis.excludedPaths": ["**/__pycache__", "**/.git"],
+    "python.analysis.autoImportCompletions": false
+}
