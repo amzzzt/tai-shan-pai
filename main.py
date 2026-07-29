@@ -5,7 +5,7 @@ import time
 import os
 # from xbhdcc_spi_lcd import ST7735Streamer  # 提速: 暂时关掉LCD
 from ball_detector import BallDetector
-# from serial_comm import SerialComm  # 提速: 暂时关掉串口
+from serial_comm import SerialComm
 
 if __name__ == "__main__":
     os.system("fuser -k 8080/tcp /dev/video9 2>/dev/null")
@@ -19,11 +19,14 @@ if __name__ == "__main__":
 
     streamer = WebStreamer(port=8080)
     bd = BallDetector()
-    # sc = SerialComm(port='/dev/ttyS7', baudrate=115200)
+    sc = SerialComm(port='/dev/ttyS7', baudrate=115200)
     # lcd = ST7735Streamer()
 
     fps = 0
     last_time = time.time()
+
+    calib_radii = [20, 30, 50, 80]     # 少画几个圆, 够用
+    calib_y_lines = [20, 40, 60]
 
     while True:
         ret, frame = cap.read()
@@ -39,8 +42,17 @@ if __name__ == "__main__":
 
         bd.detect(frame)
 
-        # if sc:
-        #     sc.send_error(bd.dx, bd.dy, bd.found)
+        if sc:
+            sc.send_error(bd.dx, bd.dy, bd.found)
+
+        # ── 校准参考线 ──
+        for yb in calib_y_lines:
+            cv2.line(frame, (0, cy0 - yb), (w, cy0 - yb), (0, 255, 255), 1)
+            cv2.line(frame, (0, cy0 + yb), (w, cy0 + yb), (0, 255, 255), 1)
+        for r in calib_radii:
+            cv2.circle(frame, (cx0, cy0), r, (255, 255, 255), 1)
+            cv2.putText(frame, "r%d" % r, (cx0 + r + 2, cy0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
 
         if bd.found:
             cv2.circle(frame, (bd.cx, bd.cy), int(bd.radius), (0, 255, 0), 1)

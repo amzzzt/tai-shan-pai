@@ -40,12 +40,12 @@ class BallDetector:
 
         # 1. 灰度 + 预处理 (全帧, 球直径可能超检测带宽度)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
         tval = float(cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[0])
 
         _, mask_full = cv2.threshold(gray, tval, 255, cv2.THRESH_BINARY_INV)
-        mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-        mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
         # 2. 裁切mask: 只在Y±20内找球
         y1 = max(0, cy0 - self.detect_band)
@@ -83,7 +83,7 @@ class BallDetector:
                 # 丢帧中: 靠近预测位置的优先
                 if self.lost_frames > 0:
                     pred_cx = self.last_cx + self.last_vx * self.lost_frames
-                    if abs(cx - pred_cx) > 80:
+                    if abs(cx - pred_cx) > 100:
                         continue
 
             if best is None or abs(area - 1257) < abs(best[0] - 1257):
@@ -94,7 +94,7 @@ class BallDetector:
             _, cx, cy, self.radius = best
             # 更新速度 + 更新大小 (EMA平滑)
             if self.locked and self.lost_frames == 0:
-                self.last_vx = self.last_vx * 0.7 + (cx - self.last_cx) * 0.3
+                self.last_vx = self.last_vx * 0.4 + (cx - self.last_cx) * 0.6  # 60%新值, 快速响应
                 self.last_radius = self.last_radius * 0.7 + self.radius * 0.3
             else:
                 self.last_radius = self.radius
