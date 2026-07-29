@@ -4,8 +4,7 @@ from xbhdcc_tools import WebStreamer
 import time
 import os
 from xbhdcc_spi_lcd import ST7735Streamer
-from rect_detector_v2 import RectDetectorV2
-from circle_tracker import CircleTracker
+from ball_detector import BallDetector
 from serial_comm import SerialComm
 
 if __name__ == "__main__":
@@ -19,85 +18,75 @@ if __name__ == "__main__":
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     streamer = WebStreamer(port=8080)
-    rd = RectDetectorV2()
-    ct = CircleTracker(rd)
-    sc = SerialComm(port='/dev/ttyS7', baudrate=115200)
-    lcd = ST7735Streamer()
+    bd = BallDetector()
+    try:
+        sc = SerialComm(port='/dev/ttyS7', baudrate=115200)
+    except Exception:
+        sc = None
+    try:
+        lcd = ST7735Streamer()
+    except Exception:
+        lcd = None
 
     fps = 0
     last_time = time.time()
-    confirm = 0
-    ct_started = False
+    calibrate = True  # 校准模式: 画同心圆帮你确定球的尺寸和范围
+
+    # 同心圆半径和Y边界线 (在校准模式下显示)
+    calib_radii = [10, 20, 30, 40, 50, 60, 80, 100]
+    calib_y_lines = [20, 40, 60]
 
     while True:
         ret, frame = cap.read()
         if not ret:
             continue
-        frame = cv2.flip(frame, 0)
+        frame = cv2.flip(frame, -1)  # 上下+左右翻转
+        frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)  # 逆时针90度
+        frame = cv2.flip(frame, 1)  # 以Y轴镜像翻转, 左右对调
+        # 截取Y轴中心±70水平带, 其余丢弃
+        cy_full = frame.shape[0] // 2
+        frame = frame[cy_full - 70:cy_full + 70, :]
         h, w = frame.shape[:2]
+        cx0, cy0 = w // 2, h // 2
 
-        rd.detect(frame)
+        bd.detect(frame)
 
-        if rd.found:
-            confirm += 1
-        else:
-            confirm = 0
+        # ── 串口发送偏差 ──
+        if sc:
+            sc.send_error(bd.dx, bd.dy, bd.found)
 
-        confirmed = confirm >= 2
-
-        # 确认后启动圆形追踪（只启动一次，丢帧不重置）
-        if confirmed and not ct_started:
-            ct.start(period=30.0, n_points=72)
-            ct_started = True
-
-        # 获取圆形路径当前点（即使丢帧也按时间推进）
-        ct_pt = ct.update(h, w) if ct_started else None
-
-        # 发偏差：只跟红圈
-        if ct_pt is not None:
-            _, _, dx, dy = ct_pt
-            sc.send_error(dx, dy, True)
-        else:
-            sc.send_error(0, 0, False)
+        # ── 校准同心圆 ──
+        if calibrate:
+            for r in calib_radii:
+                cv2.circle(frame, (cx0, cy0), r, (255, 255, 255), 1)
+                cv2.putText(frame, "r=%d" % r, (cx0 + r + 3, cy0),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            for yb in calib_y_lines:
+                cv2.line(frame, (0, cy0 - yb), (w, cy0 - yb), (0, 255, 255), 1)
+                cv2.line(frame, (0, cy0 + yb), (w, cy0 + yb), (0, 255, 255), 1)
+                cv2.putText(frame, "y=+-%d" % yb, (5, cy0 + yb - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
 
         # ── 绘制 ──
-        cv2.line(frame, (w//2-15, h//2), (w//2+15, h//2), (255,255,255), 2)
-        cv2.line(frame, (w//2, h//2-15), (w//2, h//2+15), (255,255,255), 2)
-
-        if confirmed and rd.inner_pts is not None:
-            # 绿色矩形框
-            cv2.polylines(frame, [rd.inner_pts], True, (0, 255, 0), 2)
-            cv2.line(frame, tuple(rd.inner_pts[0]), tuple(rd.inner_pts[2]), (255,0,0), 1)
-            cv2.line(frame, tuple(rd.inner_pts[1]), tuple(rd.inner_pts[3]), (255,0,0), 1)
-
-            # 圆形路径（青色虚线圆）
-            if ct.points:
-                pts_int = [(int(p[0]), int(p[1])) for p in ct.points]
-                for i in range(len(pts_int)):
-                    cv2.circle(frame, pts_int[i], 1, (255, 255, 0), -1)
-
-            # 中心红点
-            cv2.circle(frame, (rd.cx, rd.cy), 5, (0, 0, 255), -1)
-
-        # 圆形路径上的移动红点
-        if ct_pt is not None:
-            px, py, dx, dy = ct_pt
-            cv2.circle(frame, (int(px), int(py)), 8, (0, 0, 255), -1)
-            cv2.circle(frame, (int(px), int(py)), 10, (0, 0, 255), 2)
-            cv2.putText(frame, "CT: dx=%+d dy=%+d" % (dx, dy),
-                        (5, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        if bd.found:
+            cv2.circle(frame, (bd.cx, bd.cy), int(bd.radius), (0, 255, 0), 2)
+            cv2.circle(frame, (bd.cx, bd.cy), 5, (0, 0, 255), -1)
+            cv2.line(frame, (cx0, cy0), (bd.cx, bd.cy), (0, 255, 255), 1)
+            cv2.putText(frame, "dx=%+d r=%.0f" % (bd.dx, bd.radius),
+                        (5, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
         else:
-            cv2.putText(frame, "No target", (5, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(frame, "No ball", (5, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
 
-        cv2.putText(frame, "fps: %.1f" % fps, (w-150, h-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        cv2.putText(frame, "fps: %.1f" % fps, (w - 140, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2)
 
         streamer.update_frame(0, frame)
-        lcd.update_frame(frame)
-        if rd.mask is not None:
-            streamer.update_frame(1, rd.mask)
+        if lcd:
+            lcd.update_frame(frame)
+        if bd.mask is not None:
+            streamer.update_frame(1, bd.mask)
 
         curr_time = time.time()
-        fps = (1/(curr_time-last_time))*0.3 + fps*0.7
+        fps = (1 / (curr_time - last_time)) * 0.3 + fps * 0.7
         last_time = curr_time
