@@ -69,6 +69,9 @@ class BallDetector:
             (cx, cy), radius = cv2.minEnclosingCircle(cnt)
             if radius < 3 or radius > 20:
                 continue
+            # 锁定后: 拒绝跳到150px外 (管壁误检)
+            if self.locked and abs(cx - self.last_cx) > 150:
+                continue
             if area > best_area:
                 best_area = area
                 best = (cx, cy, radius)
