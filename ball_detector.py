@@ -36,11 +36,10 @@ class BallDetector:
         h, w = frame.shape[:2]
         cx0, cy0 = w // 2, h // 2
 
-        # 1. 自适应阈值 → 边缘光照差也能抓到球
+        # 1. OTSU → 画面干净
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        mask_full = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                           cv2.THRESH_BINARY_INV, 15, 4)
+        _, mask_full = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
         mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
         # 2. 裁到±20: 检测mask(管黑球白) + 显示mask(管白球黑)
@@ -60,6 +59,12 @@ class BallDetector:
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < self.min_area or area > self.max_area:
+                continue
+            peri = cv2.arcLength(cnt, True)
+            if peri < 1:
+                continue
+            # 黑线是长条(圆形度<0.3), 球是圆的(>0.4)
+            if 4 * np.pi * area / (peri * peri) < 0.35:
                 continue
             (cx, cy), radius = cv2.minEnclosingCircle(cnt)
             if radius < 3 or radius > 20:
@@ -92,8 +97,9 @@ class BallDetector:
             return False
 
         self.cx, self.cy = int(cx), cy0
-        self.dx = int(self.dx_sign * (cx - cx0))
+        raw_dx = self.dx_sign * (cx - cx0)
+        self.dx = int(max(-240, min(250, raw_dx)))    # 钳位, 杜绝大几千
         self.kf_kx = cx
-        self.kf_vx = self.last_vx
+        self.kf_vx = max(-50, min(50, self.last_vx))  # 钳位
         self.found = True
         return True
