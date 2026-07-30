@@ -3,7 +3,7 @@ import numpy as np
 from xbhdcc_tools import WebStreamer
 import time
 import os
-# from xbhdcc_spi_lcd import ST7735Streamer  # 提速: 暂时关掉LCD
+from xbhdcc_spi_lcd import ST7735Streamer
 from ball_detector import BallDetector
 from serial_comm import SerialComm
 
@@ -20,13 +20,13 @@ if __name__ == "__main__":
     streamer = WebStreamer(port=8080)
     bd = BallDetector()
     sc = SerialComm(port='/dev/ttyS7', baudrate=115200)
-    # lcd = ST7735Streamer()
+    # lcd = ST7735Streamer()  # 暂时关掉TFT, 减负
 
     fps = 0
     last_time = time.time()
 
     calib_radii = [20, 30, 50, 80]     # 少画几个圆, 够用
-    calib_y_lines = [20, 40, 60]
+    calib_y_lines = [20, 40]           # 只留±20和±40
 
     while True:
         ret, frame = cap.read()
@@ -43,7 +43,7 @@ if __name__ == "__main__":
         bd.detect(frame)
 
         if sc:
-            sc.send_error(bd.dx, bd.dy, bd.found)
+            sc.send_error(bd.dx, int(bd.kf_vx), bd.found)
 
         # ── 校准参考线 ──
         for yb in calib_y_lines:
@@ -55,13 +55,16 @@ if __name__ == "__main__":
                         cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
 
         if bd.found:
+            # 检测到的球: 绿圈+红心
             cv2.circle(frame, (bd.cx, bd.cy), int(bd.radius), (0, 255, 0), 1)
             cv2.circle(frame, (bd.cx, bd.cy), 3, (0, 0, 255), -1)
-            cv2.putText(frame, "dx=%+d" % bd.dx,
-                        (5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            # 卡尔曼预测: 蓝色竖线
+            cv2.line(frame, (int(bd.kf_kx), 0), (int(bd.kf_kx), h), (255, 0, 0), 1)
+            cv2.putText(frame, "dx=%+d  vx=%.1f" % (bd.dx, bd.kf_vx),
+                        (5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         else:
             cv2.putText(frame, "No ball", (5, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
         cv2.putText(frame, "FPS:%.1f" % fps, (w - 130, h - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
