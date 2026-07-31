@@ -129,6 +129,112 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 print(f"[WebStreamer] 推流异常: {e}")
+        # 3. 浏览器端录制+回放: /replay (不占泰山派磁盘)
+        elif self.path == '/replay':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.end_headers()
+            html = """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>录制回放</title>
+<style>
+body{font-family:Arial;background:#0f172a;color:#f1f5f9;text-align:center;padding:20px}
+img,video{max-width:640px;border-radius:8px;background:#000}
+button{padding:12px 30px;margin:10px;font-size:16px;border:none;border-radius:6px;cursor:pointer}
+.rec{background:#ef4444;color:#fff}.stop{background:#f59e0b;color:#000}.play{background:#22c55e;color:#fff}
+#status{color:#94a3b8;margin:10px}
+</style></head><body>
+<h1>浏览器端录制</h1>
+<div id="status">实时预览中, 点"开始录制"</div>
+<img id="live" src="/stream/0"><br>
+<button class="stop" onclick="stopAndDownload()">停止并下载到电脑</button>
+<div id="playback" style="display:none;margin-top:20px">
+<h2>录制完成</h2>
+<video id="player" controls style="max-width:640px"></video><br>
+<button class="play" onclick="downloadVid()">下载到电脑</button>
+</div>
+<script>
+let chunks=[], mediaRecorder, canvas, ctx;
+let img=document.getElementById('live');
+canvas=document.createElement('canvas'); ctx=canvas.getContext('2d');
+// 页面加载即开始录制
+function boot(){
+  canvas.width=img.naturalWidth||640; canvas.height=img.naturalHeight||140;
+  stream=canvas.captureStream(10); // 10fps, 省内存
+  mediaRecorder=new MediaRecorder(stream,{mimeType:'video/webm'});
+  mediaRecorder.ondataavailable=e=>chunks.push(e.data);
+  mediaRecorder.onstop=()=>{
+    let blob=new Blob(chunks,{type:'video/webm'});
+    document.getElementById('player').src=URL.createObjectURL(blob);
+    document.getElementById('playback').style.display='block';
+    document.getElementById('status').innerText='录制完成';
+  };
+  mediaRecorder.start();
+  window._recInt=setInterval(()=>ctx.drawImage(img,0,0),100);
+  document.getElementById('status').innerText='自动录制中, 离开页面时点"停止并下载"';
+}
+img.onload=boot; setTimeout(boot,2000);
+function stopAndDownload(){
+  clearInterval(window._recInt); mediaRecorder.stop();
+  setTimeout(()=>{
+    let blob=new Blob(chunks,{type:'video/webm'});
+    let a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+    a.download='replay_'+new Date().toISOString().slice(11,19).replace(/:/g,'')+'.webm';
+    a.click();
+  },500);
+}
+</script></body></html>"""
+            self.wfile.write(html.encode('utf-8'))
+
+        # 4. 录像回放+管理: /playback (泰山派本地存档)
+        elif self.path == '/playback':
+            import glob
+            videos = sorted(glob.glob("videos/*.avi"), reverse=True)
+            # 超10个自动删最旧的
+            while len(videos) > 10:
+                os.remove(videos[-1])
+                videos.pop(-1)
+            links = "".join(
+                f'<li>{v} <a href="/video?f={v}">▶播放</a> '
+                f'<a href="/video?f={v}&dl=1" download>💾下载</a> '
+                f'<a href="/delete?f={v}" style="color:#ef4444">🗑删除</a></li>'
+                for v in videos
+            )
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.end_headers()
+            html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>回放</title>
+<style>body{{font-family:Arial;background:#0f172a;color:#f1f5f9;padding:20px}}
+a{{color:#38bdf8;margin:0 6px}} li{{margin:8px 0}}</style></head>
+<body><h1>录像列表 ({len(videos)}个, 最多10)</h1><ul>{links or '<li>暂无录像</li>'}</ul></body></html>"""
+            self.wfile.write(html.encode('utf-8'))
+
+        # 删除视频: /delete?f=videos/xxx.avi
+        elif self.path.startswith('/delete?f='):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            fname = qs.get('f', [''])[0]
+            if fname and os.path.isfile(fname):
+                os.remove(fname)
+                self.send_response(302)
+                self.send_header('Location', '/playback')
+                self.end_headers()
+            else:
+                self.send_error(404)
+
+        # 4. 播放单个视频: /video?f=videos/xxx.avi
+        elif self.path.startswith('/video?f='):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            fname = qs.get('f', [''])[0]
+            if fname and os.path.isfile(fname):
+                self.send_response(200)
+                self.send_header('Content-type', 'video/x-msvideo')
+                self.send_header('Content-Length', str(os.path.getsize(fname)))
+                self.end_headers()
+                with open(fname, 'rb') as f:
+                    self.wfile.write(f.read())
+            else:
+                self.send_error(404)
+
         else:
             self.send_error(404)
 

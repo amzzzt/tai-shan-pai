@@ -6,6 +6,8 @@ import os
 from xbhdcc_spi_lcd import ST7735Streamer
 from ball_detector import BallDetector
 from serial_comm import SerialComm
+from gpio_button import GpioButton
+from datetime import datetime
 
 if __name__ == "__main__":
     os.system("fuser -k 8080/tcp /dev/video9 2>/dev/null")
@@ -24,6 +26,13 @@ if __name__ == "__main__":
 
     fps = 0
     last_time = time.time()
+
+    # ── 录像 ──
+    os.makedirs("videos", exist_ok=True)
+    btn = GpioButton(97)
+    recording = False
+    video_writer = None
+    rec_status = "REC:OFF"
 
     calib_radii = [20, 30, 50, 80]     # 少画几个圆, 够用
     calib_y_lines = [20, 40]           # 只留±20和±40
@@ -66,8 +75,25 @@ if __name__ == "__main__":
             cv2.putText(frame, "No ball", (5, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        cv2.putText(frame, "FPS:%.1f" % fps, (w - 130, h - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        # ── 按键: 切换录像 ──
+        if btn.update():
+            if recording:
+                recording = False
+                video_writer.release()
+                video_writer = None
+                rec_status = "REC:OFF"
+            else:
+                filename = f"videos/{datetime.now().strftime('%m%d_%H%M%S')}.avi"
+                fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                video_writer = cv2.VideoWriter(filename, fourcc, 15, (w, h))
+                recording = True
+                rec_status = f"REC:{filename[-13:]}"
+
+        if recording and video_writer:
+            video_writer.write(frame)
+
+        cv2.putText(frame, "FPS:%.1f %s" % (fps, rec_status), (w - 220, h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1)
 
         streamer.update_frame(0, frame)
         if bd.mask is not None:
