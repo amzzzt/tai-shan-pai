@@ -35,7 +35,7 @@ if __name__ == "__main__":
         frame = cv2.flip(frame, -1)
         frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
         frame = cv2.flip(frame, 1)
-        cy_full = frame.shape[0] // 2
+        cy_full = frame.shape[0] // 2 + 10   # 整体下移10px
         frame = frame[cy_full - 70:cy_full + 70, :]
         h, w = frame.shape[:2]
         cx0, cy0 = w // 2, h // 2
